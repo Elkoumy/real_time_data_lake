@@ -98,4 +98,4 @@ This project is licensed under the MIT License. See the [LICENSE](LICENSE) file 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Spark](https://img.shields.io/badge/Apache_Spark-3.5+-red.svg)](https://spark.apache.org/)
 [![Docker](https://img.shields.io/badge/Docker-Containers-blue)](https://www.docker.com/)
-[![GitHub Stars](https://img.shields.io/github/stars/your-username/repo-name?style=social)](https://github.com/Elkoumy/json_data_pipeline)
+[![GitHub Stars](https://img.shields.io/github/stars/your-username/repo-name?style=social)](https://github.com/Elkoumy/real_time_data_lake)

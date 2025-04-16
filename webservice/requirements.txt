@@ -1,0 +1,5 @@
+fastapi>=0.68.0
+uvicorn>=0.15.0
+confluent_kafka
+minio==7.2.3
+python-multipart

@@ -1,0 +1,199 @@
+version: "3"
+
+services:
+  catalog:
+    image: projectnessie/nessie
+    container_name: catalog
+    networks:
+      data-lake-network:
+    ports:
+      - 19120:19120
+
+  trino:
+    image: trinodb/trino
+    container_name: trino
+    networks:
+      data-lake-network:
+    ports:
+      - 8080:8080
+    volumes:
+      - "./trino/trino_connections/iceberg_datalake.properties:/etc/trino/catalog/iceberg_datalake.properties"
+      - "./trino/coordinator-config.properties:/etc/trino/config.properties"
+
+  trino-worker:
+    image: trinodb/trino
+    networks:
+      data-lake-network:
+    volumes:
+      - "./trino/trino_connections/iceberg_datalake.properties:/etc/trino/catalog/iceberg_datalake.properties"
+      - "./trino/worker-1/worker-config.properties:/etc/trino/config.properties"
+
+  storage:
+    image: minio/minio
+    container_name: storage
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:9000/minio/health/live" ]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    environment:
+      - MINIO_ROOT_USER=admin
+      - MINIO_ROOT_PASSWORD=password
+      - MINIO_DOMAIN=storage
+      - MINIO_REGION_NAME=us-east-1
+      - MINIO_REGION=us-east-1
+    networks:
+      data-lake-network:
+    ports:
+      - 9001:9001
+      - 9000:9000
+    command: ["server", "/data", "--console-address", ":9001"]
+
+
+  mc:
+    depends_on:
+      - storage
+      - catalog
+    image: minio/mc
+    container_name: mc
+    networks:
+      data-lake-network:
+        aliases:
+          - minio.storage
+    environment:
+      - AWS_ACCESS_KEY_ID=admin
+      - AWS_SECRET_ACCESS_KEY=password
+      - AWS_REGION=us-east-1
+      - AWS_DEFAULT_REGION=us-east-1
+    entrypoint: >
+      /bin/sh -c "
+      until (/usr/bin/mc config host add minio http://storage:9000 admin password) do echo '...waiting...' && sleep 1; done;
+      /usr/bin/mc mb -p minio/raw-zone;
+      /usr/bin/mc policy set public minio/raw-zone;
+      /usr/bin/mc rm -r --force minio/warehouse;
+      /usr/bin/mc mb minio/warehouse;
+      /usr/bin/mc mb minio/iceberg;
+      /usr/bin/mc mb minio/checkpoints;
+      /usr/bin/mc policy set public minio/checkpoints;
+      /usr/bin/mc policy set public minio/warehouse;
+      /usr/bin/mc policy set public minio/iceberg;
+      tail -f /dev/null
+      "
+
+  webservice:
+    build:
+      context: ./webservice
+    container_name: web-service-api
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8000/health" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      MINIO_ENDPOINT: storage:9000
+      MINIO_ACCESS_KEY: admin
+      MINIO_SECRET_KEY: password
+      UPLOADS_BUCKET_NAME: uploads
+    depends_on:
+      - kafka
+    ports:
+      - 8000:8000
+    networks:
+      - data-lake-network
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: kafka
+    ports:
+      - 9092:9092
+    networks:
+      - data-lake-network
+    healthcheck:
+      test: [ "CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092" ]
+      interval: 5s
+      timeout: 10s
+      retries: 10
+
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      CLUSTER_ID: "cAJ8d9BqSvKhXklYr1SNOg"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: true
+    command: >
+      bash -c "/etc/confluent/docker/run &
+               while ! kafka-topics --bootstrap-server kafka:9092 --list > /dev/null 2>&1; do
+                 sleep 1;
+               done;
+               kafka-topics --bootstrap-server kafka:9092 --create --topic session_topic --if-not-exists --partitions 1 --replication-factor 1;
+               kafka-topics --bootstrap-server kafka:9092 --create --topic employee_topic --if-not-exists --partitions 1 --replication-factor 1;
+               kafka-topics --bootstrap-server kafka:9092 --create --topic client_topic --if-not-exists --partitions 1 --replication-factor 1;
+               wait"
+
+  spark:
+    build:
+      context: .
+      dockerfile: ./spark/Dockerfile
+    container_name: spark-master
+    ports:
+      - 7077:7077
+      - 8088:8080
+    networks:
+      - data-lake-network
+    environment:
+      - AWS_ACCESS_KEY_ID=admin
+      - AWS_SECRET_ACCESS_KEY=password
+      - AWS_REGION=us-east-1
+    volumes:
+      - ./spark-jobs:/app
+    command: >
+      /opt/bitnami/spark/bin/spark-submit
+      --master local[*]
+      --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions,org.projectnessie.spark.extensions.NessieSparkSessionExtensions
+      --conf spark.sql.catalog.nessie=org.apache.iceberg.spark.SparkCatalog
+      --conf spark.sql.catalog.nessie.catalog-impl=org.apache.iceberg.nessie.NessieCatalog
+      --conf spark.sql.catalog.nessie.uri=http://catalog:19120/api/v1
+      --conf spark.sql.catalog.nessie.ref=main
+      --conf spark.sql.catalog.nessie.warehouse=s3a://warehouse/
+      --conf spark.sql.catalog.nessie.authentication.type=NONE
+      --conf spark.sql.defaultCatalog=nessie
+      --conf spark.sql.catalog.nessie.cache-enabled=true
+      --conf spark.sql.catalog.nessie.gc-enabled=true
+      --conf spark.hadoop.fs.s3a.endpoint=http://storage:9000
+      --conf spark.hadoop.fs.s3a.access.key=admin
+      --conf spark.hadoop.fs.s3a.secret.key=password
+      --conf spark.hadoop.fs.s3a.path.style.access=true
+      /app/main.py
+
+  data-simulator:
+    build:
+      context: ./simulator
+      dockerfile: Dockerfile
+    container_name: data-simulator
+    environment:
+      - BASE_URL=http://webservice:8000
+      - SEND_INTERVAL=0.01 #(~100 msg/sec)
+    networks:
+      - data-lake-network
+    depends_on:
+      - webservice
+      - kafka
+    volumes:
+      - ./data:/app/data
+    deploy:
+      resources:
+        limits:
+          cpus: '0.3'
+          memory: 256M
+
+networks:
+  data-lake-network:
